@@ -1,6 +1,4 @@
-# 01-offline-indexing
-
-## 离线索引构建
+# 01-offline-indexing 离线索引构建
 
 ### parse_pdfs.py：先让 MinerU 解析 PDF
 ```cmd
@@ -22,9 +20,7 @@ python scripts\build_manifest.py --build-chunks-preview --force --force-vlm
 python scripts\build_index.py --reset
 ```
 
-## 02-online-query
-
-离线索引完成后，可以使用在线问答入口：
+# 02-online-query 在线问答
 
 ```cmd
 python scripts\ask.py --query "DarkIR 在 LOLBlur 数据集上的表现如何？"
@@ -54,4 +50,23 @@ python scripts\ask.py --query "DarkIR 在 LOLBlur 数据集上的表现如何？
 
 ```cmd
 python scripts\ask.py --env-file .env.local --query "DarkIR 的核心贡献是什么？"
+```
+
+# 批量评测
+
+脚本：[eval/run_questions.py](D:/t_study/python_code/myRAG/eval/run_questions.py)。
+
+用法：
+
+```cmd
+python eval\run_questions.py
+```
+
+```text
+它会逐行读取： eval\questions.txt
+然后逐个执行等价于： python scripts\ask.py --query "问题"
+最后把结果写到 `eval` 文件夹下，文件名类似： 20260612_114530.json
+也支持这些参数：
+D:\t_config\anaconda\envs\ai\python.exe eval\run_questions.py --show-debug --top-k 8
+D:\t_config\anaconda\envs\ai\python.exe eval\run_questions.py --stop-on-error
 ```

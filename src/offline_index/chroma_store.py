@@ -71,6 +71,92 @@ def add_chunks(collection, chunks: list[ChunkRecord], embeddings: list[list[floa
     collection.add(ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas)
 
 
+def sync_chunks_by_location(collection, chunks: list[ChunkRecord], embedder) -> dict[str, int]:
+    """Synchronize chunks by meta_location and content_md5 before embedding new content."""
+
+    added = 0
+    updated = 0
+    skipped = 0
+    deleted = 0
+    chunks_to_add: list[ChunkRecord] = []
+    if not chunks:
+        return {"added": 0, "updated": 0, "skipped": 0, "deleted": 0, "embedded": 0}
+
+    doc_id = _doc_id_for_chunks(chunks)
+    existing_by_location = _existing_chunks_by_location(collection, doc_id)
+    current_locations: set[str] = set()
+    ids_to_delete: list[str] = []
+
+    for chunk in chunks:
+        meta_location = _require_metadata(chunk, "meta_location")
+        content_md5 = _require_metadata(chunk, "content_md5")
+        if meta_location in current_locations:
+            raise ValueError(f"duplicate meta_location in current chunks: {meta_location}")
+        current_locations.add(meta_location)
+        existing = existing_by_location.get(meta_location)
+        if existing is None:
+            chunks_to_add.append(chunk)
+            added += 1
+            continue
+        if existing.get("content_md5") == content_md5:
+            skipped += 1
+            continue
+        ids_to_delete.append(str(existing["id"]))
+        chunks_to_add.append(chunk)
+        added += 1
+        updated += 1
+
+    for meta_location, existing in existing_by_location.items():
+        if meta_location not in current_locations:
+            ids_to_delete.append(str(existing["id"]))
+            deleted += 1
+
+    if ids_to_delete:
+        collection.delete(ids=ids_to_delete)
+
+    embeddings_to_add = embedder.embed_documents([chunk.document for chunk in chunks_to_add])
+    add_chunks(collection, chunks_to_add, embeddings_to_add)
+    return {"added": added, "updated": updated, "skipped": skipped, "deleted": deleted, "embedded": len(chunks_to_add)}
+
+
+def _doc_id_for_chunks(chunks: list[ChunkRecord]) -> str:
+    """Return the single doc_id shared by a group of chunks."""
+
+    doc_ids = {_require_metadata(chunk, "doc_id") for chunk in chunks}
+    if len(doc_ids) != 1:
+        raise ValueError("sync_chunks_by_location requires chunks from exactly one doc_id")
+    return next(iter(doc_ids))
+
+
+def _existing_chunks_by_location(collection, doc_id: str) -> dict[str, dict[str, str]]:
+    """Fetch existing chunk metadata for one doc_id and index it by meta_location."""
+
+    existing = collection.get(where={"doc_id": doc_id}, include=["metadatas"])
+    existing_ids = existing.get("ids", []) if isinstance(existing, dict) else []
+    existing_metadatas = existing.get("metadatas", []) if isinstance(existing, dict) else []
+    by_location: dict[str, dict[str, str]] = {}
+    for item_id, metadata in zip(existing_ids, existing_metadatas):
+        if not isinstance(metadata, dict):
+            continue
+        meta_location = str(metadata.get("meta_location", ""))
+        if not meta_location:
+            continue
+        by_location[meta_location] = {
+            "id": str(item_id),
+            "content_md5": str(metadata.get("content_md5", "")),
+        }
+    return by_location
+
+
+def _require_metadata(chunk: ChunkRecord, key: str) -> str:
+    """Read a required string metadata value from one chunk."""
+
+    value = str(chunk.metadata.get(key, ""))
+    if not value:
+        raise ValueError(f"chunk {chunk.id} missing metadata.{key}")
+    return value
+
+
 def delete_by_doc_id(collection, doc_id: str) -> None:
     """Delete all chunks in a Chroma collection for one doc_id."""
 
@@ -102,4 +188,3 @@ def _sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         else:
             sanitized[key] = json.dumps(value, ensure_ascii=False)
     return sanitized
-

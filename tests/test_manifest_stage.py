@@ -12,9 +12,9 @@ from unittest.mock import patch
 from offline_index.document_manifest import load_manifest, save_manifest, upsert_document
 from offline_index.index_report import IndexReport
 from offline_index.mineru_output_locator import locate_mineru_output
-from offline_index.source_file_finder import compute_file_md5, scan_pdfs
+from offline_index.source_file_finder import compute_file_md5, scan_pdfs, select_pdf_candidates
 from offline_index.schema import ChunkRecord, DocumentRecord, PdfCandidate
-from scripts.build_manifest import _format_elapsed, _make_preview_file_name, _print_chunk_progress, _process_candidate
+from scripts.build_manifest import _format_elapsed, _make_chunk_file_name, _print_chunk_progress, _process_candidate
 
 
 class ManifestStageTests(unittest.TestCase):
@@ -42,11 +42,61 @@ class ManifestStageTests(unittest.TestCase):
             self.assertEqual(candidates[0].file_size, len(b"same content"))
             self.assertGreater(candidates[0].modified_time, 0)
 
+    def test_select_pdf_candidates_uses_registry_and_parse_outputs(self):
+        """Verify new scope selects unknown PDFs and known PDFs with missing content_list_v2."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.pdf"
+            second = root / "second.pdf"
+            third = root / "third.pdf"
+            output_root = root / "out"
+            first.write_bytes(b"old")
+            second.write_bytes(b"new")
+            third.write_bytes(b"known-but-missing-output")
+            first_auto = output_root / "first" / "auto"
+            first_auto.mkdir(parents=True)
+            (first_auto / "first_content_list_v2.json").write_text("[]", encoding="utf-8")
+            candidates = scan_pdfs(root, recursive=False)
+            manifest = load_manifest(root / "processed_pdfs.json")
+            upsert_document(
+                manifest,
+                DocumentRecord(
+                    doc_id="doc_existing",
+                    file_name=first.name,
+                    source_path=str(first.resolve()),
+                    pdf_md5=compute_file_md5(first),
+                    file_size=first.stat().st_size,
+                    mineru_output_dir=str(first_auto.resolve()),
+                    content_list_v2_path=str((first_auto / "first_content_list_v2.json").resolve()),
+                    index_status="parsed",
+                ),
+            )
+            upsert_document(
+                manifest,
+                DocumentRecord(
+                    doc_id="doc_missing_output",
+                    file_name=third.name,
+                    source_path=str(third.resolve()),
+                    pdf_md5=compute_file_md5(third),
+                    file_size=third.stat().st_size,
+                    mineru_output_dir=str((output_root / "third" / "auto").resolve()),
+                    content_list_v2_path=str((output_root / "third" / "auto" / "third_content_list_v2.json").resolve()),
+                    index_status="parsed",
+                ),
+            )
+
+            selected_new = select_pdf_candidates(candidates, manifest, scope="new", mineru_output_root=output_root)
+            selected_all = select_pdf_candidates(candidates, manifest, scope="all", mineru_output_root=output_root)
+
+        self.assertEqual([candidate.file_name for candidate in selected_new], ["second.pdf", "third.pdf"])
+        self.assertEqual([candidate.file_name for candidate in selected_all], ["first.pdf", "second.pdf", "third.pdf"])
+
     def test_manifest_load_save_find_and_upsert(self):
         """Verify manifest creation, lookup by MD5/source path, and record replacement."""
 
         with tempfile.TemporaryDirectory() as tmp:
-            manifest_path = Path(tmp) / "data" / "index" / "rag_documents.json"
+            manifest_path = Path(tmp) / "data" / "index" / "processed_pdfs.json"
             manifest = load_manifest(manifest_path)
             self.assertEqual(manifest.documents, [])
 
@@ -103,7 +153,7 @@ class ManifestStageTests(unittest.TestCase):
         """Verify saved manifest uses the expected top-level documents list."""
 
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "rag_documents.json"
+            path = Path(tmp) / "processed_pdfs.json"
             manifest = load_manifest(path)
             upsert_document(
                 manifest,
@@ -130,7 +180,7 @@ class ManifestStageTests(unittest.TestCase):
             pdf = root / "paper.pdf"
             output_root = root / "out"
             missing_auto = output_root / "paper" / "auto"
-            preview_dir = root / "debug"
+            chunk_dir = root / "chunks"
             pdf.write_bytes(b"%PDF")
             missing_auto.mkdir(parents=True)
             candidate = PdfCandidate(
@@ -140,7 +190,7 @@ class ManifestStageTests(unittest.TestCase):
                 pdf_md5=compute_file_md5(pdf),
                 modified_time=pdf.stat().st_mtime,
             )
-            manifest = load_manifest(root / "rag_documents.json")
+            manifest = load_manifest(root / "processed_pdfs.json")
             upsert_document(
                 manifest,
                 DocumentRecord(
@@ -156,10 +206,10 @@ class ManifestStageTests(unittest.TestCase):
             args = Namespace(
                 force=False,
                 mineru_output_root=output_root,
-                build_chunks_preview=False,
-                preview_output_dir=preview_dir,
+                chunks_output_dir=chunk_dir,
                 chunk_size=800,
                 chunk_overlap=120,
+                vlm_mode="auto",
             )
             report = IndexReport()
 
@@ -170,15 +220,15 @@ class ManifestStageTests(unittest.TestCase):
             self.assertEqual(manifest.documents[0].index_status, "pending")
             self.assertIn("content_list_v2", manifest.documents[0].error_message)
 
-    def test_build_manifest_builds_preview_for_existing_md5_without_chunks(self):
-        """Verify parsed documents without chunks are not skipped when preview build is requested."""
+    def test_build_manifest_builds_chunks_for_existing_md5_without_chunks(self):
+        """Verify parsed documents without chunks build chunk files when selected."""
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             pdf = root / "HVI.pdf"
             output_root = root / "out"
             auto_dir = output_root / "HVI" / "auto"
-            preview_dir = root / "debug"
+            chunk_dir = root / "chunks"
             pdf.write_bytes(b"%PDF")
             auto_dir.mkdir(parents=True)
             (auto_dir / "HVI_content_list_v2.json").write_text("[]", encoding="utf-8")
@@ -189,7 +239,7 @@ class ManifestStageTests(unittest.TestCase):
                 pdf_md5=compute_file_md5(pdf),
                 modified_time=pdf.stat().st_mtime,
             )
-            manifest = load_manifest(root / "rag_documents.json")
+            manifest = load_manifest(root / "processed_pdfs.json")
             upsert_document(
                 manifest,
                 DocumentRecord(
@@ -206,31 +256,68 @@ class ManifestStageTests(unittest.TestCase):
             args = Namespace(
                 force=False,
                 mineru_output_root=output_root,
-                build_chunks_preview=True,
-                preview_output_dir=preview_dir,
+                chunks_output_dir=chunk_dir,
                 chunk_size=800,
                 chunk_overlap=120,
+                vlm_mode="auto",
             )
             report = IndexReport()
 
-            with patch("scripts.build_manifest._build_chunks_preview", return_value=(Counter({"text": 1}), preview_dir / "HVI_chunks_preview.json", None)) as build:
+            with patch("scripts.build_manifest._build_chunks_file", return_value=(Counter({"text": 1}), chunk_dir / "HVI_chunks.json", None)) as build:
                 _process_candidate(candidate, args, manifest, report)
 
             build.assert_called_once()
             self.assertEqual(report.existing_skipped, 0)
-            self.assertEqual(report.chunk_preview_generated, 1)
+            self.assertEqual(report.chunk_files_generated, 1)
             self.assertEqual(manifest.documents[0].index_status, "chunked")
             self.assertEqual(manifest.documents[0].chunk_count, 1)
 
-    def test_build_manifest_skips_existing_md5_with_chunks_when_not_forced(self):
-        """Verify already chunked documents still skip preview rebuilding without --force."""
+    def test_process_candidate_always_builds_chunks_when_output_exists(self):
+        """Verify chunk files are generated as a required stage."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pdf = root / "HVI.pdf"
+            output_root = root / "out"
+            auto_dir = output_root / "HVI" / "auto"
+            chunk_dir = root / "chunks"
+            pdf.write_bytes(b"%PDF")
+            auto_dir.mkdir(parents=True)
+            (auto_dir / "HVI_content_list_v2.json").write_text("[]", encoding="utf-8")
+            candidate = PdfCandidate(
+                source_path=str(pdf.resolve()),
+                file_name=pdf.name,
+                file_size=pdf.stat().st_size,
+                pdf_md5=compute_file_md5(pdf),
+                modified_time=pdf.stat().st_mtime,
+            )
+            manifest = load_manifest(root / "processed_pdfs.json")
+            args = Namespace(
+                force=False,
+                mineru_output_root=output_root,
+                chunks_output_dir=chunk_dir,
+                chunk_size=800,
+                chunk_overlap=120,
+                vlm_mode="auto",
+            )
+            report = IndexReport()
+
+            with patch("scripts.build_manifest._build_chunks_file", return_value=(Counter({"text": 1}), chunk_dir / "HVI_chunks.json", None)) as build:
+                _process_candidate(candidate, args, manifest, report)
+
+            build.assert_called_once()
+            self.assertEqual(report.chunk_files_generated, 1)
+            self.assertEqual(manifest.documents[0].index_status, "chunked")
+
+    def test_build_manifest_rebuilds_chunks_for_existing_md5_when_selected(self):
+        """Verify chunk generation is a required stage for selected documents."""
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             pdf = root / "paper.pdf"
             output_root = root / "out"
             auto_dir = output_root / "paper" / "auto"
-            preview_dir = root / "debug"
+            chunk_dir = root / "chunks"
             pdf.write_bytes(b"%PDF")
             auto_dir.mkdir(parents=True)
             (auto_dir / "paper_content_list_v2.json").write_text("[]", encoding="utf-8")
@@ -241,7 +328,7 @@ class ManifestStageTests(unittest.TestCase):
                 pdf_md5=compute_file_md5(pdf),
                 modified_time=pdf.stat().st_mtime,
             )
-            manifest = load_manifest(root / "rag_documents.json")
+            manifest = load_manifest(root / "processed_pdfs.json")
             upsert_document(
                 manifest,
                 DocumentRecord(
@@ -259,22 +346,22 @@ class ManifestStageTests(unittest.TestCase):
             args = Namespace(
                 force=False,
                 mineru_output_root=output_root,
-                build_chunks_preview=True,
-                preview_output_dir=preview_dir,
+                chunks_output_dir=chunk_dir,
                 chunk_size=800,
                 chunk_overlap=120,
+                vlm_mode="auto",
             )
             report = IndexReport()
 
-            with patch("scripts.build_manifest._build_chunks_preview") as build:
+            with patch("scripts.build_manifest._build_chunks_file", return_value=(Counter({"text": 1}), chunk_dir / "paper_chunks.json", None)) as build:
                 _process_candidate(candidate, args, manifest, report)
 
-            build.assert_not_called()
-            self.assertEqual(report.existing_skipped, 1)
-            self.assertEqual(report.chunk_preview_generated, 0)
+            build.assert_called_once()
+            self.assertEqual(report.existing_skipped, 0)
+            self.assertEqual(report.chunk_files_generated, 1)
 
-    def test_preview_file_name_uses_pdf_stem_and_full_md5(self):
-        """Verify chunk preview files are named from the source PDF stem and full MD5."""
+    def test_chunk_file_name_uses_pdf_stem_and_full_md5(self):
+        """Verify chunk files are named from the source PDF stem and full MD5."""
 
         candidate = PdfCandidate(
             source_path=str(Path("pdfs") / "A Paper.pdf"),
@@ -285,8 +372,8 @@ class ManifestStageTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            _make_preview_file_name(candidate),
-            "A Paper_0123456789abcdef0123456789abcdef_chunks_preview.json",
+            _make_chunk_file_name(candidate),
+            "A Paper_0123456789abcdef0123456789abcdef_chunks.json",
         )
 
     def test_format_elapsed_uses_minute_and_second_display(self):

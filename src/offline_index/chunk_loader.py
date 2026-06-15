@@ -1,4 +1,4 @@
-﻿# Loads and saves ChunkRecord objects from chunks_preview JSON files.
+﻿# Loads and saves ChunkRecord objects from final chunk JSON files.
 from __future__ import annotations
 
 import json
@@ -10,7 +10,7 @@ from offline_index.utils import ensure_dir
 
 
 def load_chunks(path: Path) -> list[ChunkRecord]:
-    """Load chunk records from a preview JSON file."""
+    """Load chunk records from a chunk JSON file."""
 
     with path.open("r", encoding="utf-8") as file:
         payload = json.load(file)
@@ -23,7 +23,7 @@ def load_chunks(path: Path) -> list[ChunkRecord]:
 
 
 def save_chunks(path: Path, chunks: list[ChunkRecord]) -> None:
-    """Save chunk records to a UTF-8 JSON preview file."""
+    """Save chunk records to a UTF-8 JSON chunk file."""
 
     ensure_dir(path.parent)
     payload = [chunk.model_dump() for chunk in chunks]
@@ -37,7 +37,7 @@ def _extract_raw_chunks(payload: Any) -> list[Any]:
         return payload
     if isinstance(payload, dict) and isinstance(payload.get("chunks"), list):
         return payload["chunks"]
-    raise ValueError("chunks preview must be a list or a dict containing a 'chunks' list")
+    raise ValueError("chunk JSON must be a list or a dict containing a 'chunks' list")
 
 
 def _validate_raw_chunk(item: Any, index: int, path: Path) -> None:
@@ -48,4 +48,3 @@ def _validate_raw_chunk(item: Any, index: int, path: Path) -> None:
     missing = [field for field in ("id", "document", "metadata") if field not in item]
     if missing:
         raise ValueError(f"chunk #{index} in {path} is missing required fields: {', '.join(missing)}")
-

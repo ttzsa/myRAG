@@ -23,7 +23,7 @@ class SemanticBlock(BaseModel):
 
 
 class ChunkRecord(BaseModel):
-    """Represents one final RAG chunk preview record."""
+    """Represents one final RAG chunk record."""
 
     id: str
     document: str
@@ -39,10 +39,26 @@ class DocumentRecord(BaseModel):
     pdf_md5: str = ""
     file_size: int = 0
     mineru_output_dir: str = ""
+    parser_method: str = ""
+    parse_status: str = ""
+    parse_output_dir: str = ""
+    content_list_v2_path: str = ""
+    content_list_v2_md5: str = ""
+    parse_error: str = ""
+    chunk_status: str = ""
+    chunk_path: str = ""
+    chunk_file_md5: str = ""
+    chunk_config_hash: str = ""
+    vlm_mode: str = ""
+    chunk_error: str = ""
     chunk_count: int = 0
     text_chunk_count: int = 0
     image_chunk_count: int = 0
     table_chunk_count: int = 0
+    indexed_chunk_file_md5: str = ""
+    embedding_model: str = ""
+    embedding_dimension: int = 0
+    index_error: str = ""
     indexed_at: str = ""
     index_status: str = "pending"
     error_message: str = ""
@@ -72,7 +88,7 @@ class MinerUOutputLocation(BaseModel):
 
 
 class DocumentManifest(BaseModel):
-    """Represents the rag_documents.json payload."""
+    """Represents the processed_pdfs.json payload."""
 
     documents: list[DocumentRecord] = Field(default_factory=list)
 

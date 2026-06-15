@@ -9,11 +9,12 @@ from offline_index.mineru_runner import (
     expected_mineru_output_dir,
     find_pdfs,
     is_already_parsed,
+    parse_pdf_candidates,
     parse_pdf_dir,
     run_mineru_cli,
 )
-from offline_index.source_file_finder import compute_file_md5
-from offline_index.schema import DocumentRecord
+from offline_index.source_file_finder import compute_file_md5, scan_pdfs
+from offline_index.schema import DocumentRecord, PdfCandidate
 
 
 class MinerURunnerTests(unittest.TestCase):
@@ -31,6 +32,8 @@ class MinerURunnerTests(unittest.TestCase):
             top_pdf.write_bytes(b"%PDF")
             nested_pdf.write_bytes(b"%PDF")
             (root / "note.txt").write_text("ignore", encoding="utf-8")
+            (root / "~$temp.pdf").write_bytes(b"%PDF")
+            (root / ".hidden.pdf").write_bytes(b"%PDF")
 
             self.assertEqual(find_pdfs(top_pdf), [top_pdf.resolve()])
             self.assertEqual(find_pdfs(root, recursive=False), [top_pdf.resolve()])
@@ -62,7 +65,7 @@ class MinerURunnerTests(unittest.TestCase):
             pdf = root / "A.pdf"
             output_root = root / "out"
             mineru = root / "mineru.exe"
-            manifest_path = root / "rag_documents.json"
+            manifest_path = root / "processed_pdfs.json"
             pdf.write_bytes(b"%PDF")
             mineru.write_bytes(b"exe")
             auto_dir = output_root / "A" / "auto"
@@ -89,7 +92,7 @@ class MinerURunnerTests(unittest.TestCase):
             pdf = root / "A.pdf"
             output_root = root / "out"
             mineru = root / "mineru.exe"
-            manifest_path = root / "rag_documents.json"
+            manifest_path = root / "processed_pdfs.json"
             pdf.write_bytes(b"%PDF")
             mineru.write_bytes(b"exe")
             auto_dir = output_root / "A" / "auto"
@@ -126,7 +129,7 @@ class MinerURunnerTests(unittest.TestCase):
             pdf = root / "A.pdf"
             output_root = root / "out"
             mineru = root / "mineru.exe"
-            manifest_path = root / "rag_documents.json"
+            manifest_path = root / "processed_pdfs.json"
             pdf.write_bytes(b"%PDF")
             mineru.write_bytes(b"exe")
             auto_dir = output_root / "A" / "auto"
@@ -162,7 +165,7 @@ class MinerURunnerTests(unittest.TestCase):
             pdf = root / "A.pdf"
             output_root = root / "out"
             mineru = root / "mineru.exe"
-            manifest_path = root / "rag_documents.json"
+            manifest_path = root / "processed_pdfs.json"
             pdf.write_bytes(b"old")
             mineru.write_bytes(b"exe")
             auto_dir = output_root / "A" / "auto"
@@ -205,7 +208,7 @@ class MinerURunnerTests(unittest.TestCase):
             second = root / "B.pdf"
             output_root = root / "out"
             mineru = root / "mineru.exe"
-            manifest_path = root / "rag_documents.json"
+            manifest_path = root / "processed_pdfs.json"
             first.write_bytes(b"same")
             second.write_bytes(b"same")
             mineru.write_bytes(b"exe")
@@ -263,6 +266,36 @@ class MinerURunnerTests(unittest.TestCase):
             self.assertTrue(result.success)
             self.assertFalse(result.skipped)
 
+    def test_run_mineru_cli_passes_local_model_env_to_subprocess(self):
+        """Verify MinerU local model settings are passed into the child process environment."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pdf = root / "A Paper.pdf"
+            output_root = root / "out"
+            mineru = root / "mineru.exe"
+            tools_config = root / "mineru.json"
+            pdf.write_bytes(b"%PDF")
+            mineru.write_bytes(b"exe")
+            tools_config.write_text("{}", encoding="utf-8")
+            completed = Mock(returncode=0, stdout="ok", stderr="")
+
+            with patch("offline_index.mineru_runner.subprocess.run", return_value=completed) as run:
+                result = run_mineru_cli(
+                    pdf,
+                    output_root,
+                    mineru,
+                    force=True,
+                    model_source="local",
+                    tools_config_json=tools_config,
+                )
+
+            options = run.call_args.kwargs
+            self.assertEqual(options["env"]["MINERU_MODEL_SOURCE"], "local")
+            self.assertEqual(options["env"]["MINERU_TOOLS_CONFIG_JSON"], str(tools_config.resolve()))
+            self.assertTrue(result.success)
+            self.assertFalse(result.skipped)
+
 
     def test_parse_pdf_dir_continues_after_one_failure(self):
         """Verify batch parsing records failures and continues with later PDFs."""
@@ -286,6 +319,43 @@ class MinerURunnerTests(unittest.TestCase):
             self.assertFalse(results[0].success)
             self.assertIn("failed", results[0].error_message)
             self.assertTrue(results[1].success)
+
+    def test_parse_pdf_candidates_parses_only_discovered_selection(self):
+        """Verify parse stage processes exactly the candidates selected by discover."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_root = root / "out"
+            first = root / "first.pdf"
+            second = root / "second.pdf"
+            mineru = root / "mineru.exe"
+            first.write_bytes(b"%PDF first")
+            second.write_bytes(b"%PDF second")
+            mineru.write_bytes(b"exe")
+            candidates = scan_pdfs(root, recursive=False)
+            selected = [candidate for candidate in candidates if candidate.file_name == "second.pdf"]
+            completed = Mock(returncode=0, stdout="ok", stderr="")
+
+            with patch("offline_index.mineru_runner.subprocess.run", return_value=completed) as run:
+                results = parse_pdf_candidates(selected, output_root, mineru, parser_method="mineru")
+
+            self.assertEqual([Path(result.pdf_path).name for result in results], ["second.pdf"])
+            self.assertEqual(run.call_count, 1)
+            self.assertIn(str(second.resolve()), run.call_args.args[0])
+
+    def test_parse_pdf_candidates_rejects_unimplemented_parser_method(self):
+        """Verify parser-method is explicit when a parser is not available yet."""
+
+        candidate = PdfCandidate(
+            source_path=str(Path("paper.pdf").resolve()),
+            file_name="paper.pdf",
+            file_size=1,
+            pdf_md5="abc",
+            modified_time=1.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "pymupdf"):
+            parse_pdf_candidates([candidate], Path("out"), Path("parser.exe"), parser_method="pymupdf")
 
     def test_run_mineru_cli_error_message_keeps_full_output(self):
         """Verify failed MinerU calls keep full stderr/stdout details."""

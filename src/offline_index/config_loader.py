@@ -30,6 +30,8 @@ class MinerUConfig:
     exe: Path
     backend: str
     method: str
+    model_source: str
+    tools_config_json: Path | None
 
 
 @dataclass(frozen=True)
@@ -99,8 +101,8 @@ def load_config(env_file: Path = Path(".env")) -> AppConfig:
         paths=PathsConfig(
             pdf_root=_get_path(values, "PDF_ROOT", "documents/source_documents"),
             mineru_output_root=_get_path(values, "MINERU_OUTPUT_ROOT", "documents/output_pipeline"),
-            manifest_path=_get_path(values, "RAG_DOCUMENTS_PATH", "data/index/rag_documents.json"),
-            debug_dir=_get_path(values, "DEBUG_DIR", "data/debug"),
+            manifest_path=_get_path(values, "PROCESSED_PDFS_PATH", "data/index/processed_pdfs.json"),
+            debug_dir=_get_path(values, "CHUNKS_DIR", "data/chunks"),
             pdf_recursive=_get_bool(values, "PDF_RECURSIVE", True),
             force_rebuild=_get_bool(values, "FORCE_REBUILD", False),
         ),
@@ -108,6 +110,8 @@ def load_config(env_file: Path = Path(".env")) -> AppConfig:
             exe=_get_path(values, "MINERU_EXE", r"D:\t_config\anaconda\envs\ai\Scripts\mineru.exe"),
             backend=_get_str(values, "MINERU_BACKEND", "pipeline"),
             method=_get_str(values, "MINERU_METHOD", "auto"),
+            model_source=_get_str(values, "MINERU_MODEL_SOURCE", "local"),
+            tools_config_json=_get_optional_path(values, "MINERU_TOOLS_CONFIG_JSON"),
         ),
         chroma=ChromaConfig(
             persist_dir=_get_path(values, "CHROMA_PERSIST_DIRECTORY", "data/chroma"),
@@ -166,6 +170,15 @@ def _get_path(values: dict, key: str, default: str) -> Path:
     """Read a path value from parsed dotenv values."""
 
     return Path(_get_str(values, key, default))
+
+
+def _get_optional_path(values: dict, key: str) -> Path | None:
+    """Read an optional path value from parsed dotenv values."""
+
+    value = values.get(key)
+    if value is None or value == "":
+        return None
+    return Path(str(value))
 
 
 def _get_bool(values: dict, key: str, default: bool) -> bool:

@@ -24,9 +24,11 @@ class ConfigLoaderTests(unittest.TestCase):
                         "MINERU_EXE=C:/mineru/mineru.exe",
                         "MINERU_BACKEND=pipeline",
                         "MINERU_METHOD=auto",
+                        "MINERU_MODEL_SOURCE=local",
+                        "MINERU_TOOLS_CONFIG_JSON=C:/Users/test/mineru.json",
                         "MINERU_OUTPUT_ROOT=out",
-                        "RAG_DOCUMENTS_PATH=data/index/rag_documents.json",
-                        "DEBUG_DIR=data/debug",
+                        "PROCESSED_PDFS_PATH=data/index/processed_pdfs.json",
+                        "CHUNKS_DIR=data/chunks",
                         "CHROMA_PERSIST_DIRECTORY=data/chroma",
                         "CHROMA_COLLECTION_NAME=rag_chunks",
                         "INGEST_CHUNK_SIZE=900",
@@ -58,7 +60,11 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertEqual(config.paths.pdf_root, Path("pdfs"))
             self.assertFalse(config.paths.pdf_recursive)
             self.assertTrue(config.paths.force_rebuild)
+            self.assertEqual(config.paths.manifest_path, Path("data/index/processed_pdfs.json"))
+            self.assertEqual(config.paths.debug_dir, Path("data/chunks"))
             self.assertEqual(config.mineru.exe, Path("C:/mineru/mineru.exe"))
+            self.assertEqual(config.mineru.model_source, "local")
+            self.assertEqual(config.mineru.tools_config_json, Path("C:/Users/test/mineru.json"))
             self.assertEqual(config.chunking.chunk_size, 900)
             self.assertEqual(config.chunking.chunk_overlap, 100)
             self.assertEqual(config.embedding.api_key, "embedding-secret")
@@ -75,6 +81,37 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertEqual(config.vlm.max_retries, 4)
             self.assertEqual(config.vlm.cache_path, Path("data/cache/vlm_summaries.json"))
             self.assertEqual(config.vlm.max_images_per_doc, 12)
+
+    def test_load_config_defaults_to_processed_pdfs_registry(self):
+        """Verify the default PDF processing record path uses processed_pdfs.json."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text("", encoding="utf-8")
+
+            config = load_config(env_path)
+
+        self.assertEqual(config.paths.manifest_path, Path("data/index/processed_pdfs.json"))
+
+    def test_load_config_ignores_legacy_registry_and_debug_names(self):
+        """Verify legacy RAG_DOCUMENTS_PATH and DEBUG_DIR no longer configure offline paths."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "RAG_DOCUMENTS_PATH=data/index/rag_documents.json",
+                        "DEBUG_DIR=data/debug",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(env_path)
+
+        self.assertEqual(config.paths.manifest_path, Path("data/index/processed_pdfs.json"))
+        self.assertEqual(config.paths.debug_dir, Path("data/chunks"))
 
     def test_resolve_value_prefers_cli_value_over_config_value(self):
         """Verify explicit CLI values override .env derived config values."""

@@ -1,4 +1,4 @@
-﻿# Command-line entry point for embedding preview chunks and writing them to ChromaDB.
+﻿# Command-line entry point for embedding chunks and writing them to ChromaDB.
 from __future__ import annotations
 
 import argparse
@@ -19,12 +19,13 @@ from offline_index.document_manifest import load_manifest, save_manifest, upsert
 from offline_index.embedder import create_embedder
 from offline_index.offline_pipeline import build_chunks_from_mineru_content, create_visual_summarizer
 from offline_index.schema import ChunkRecord
+from offline_index.utils import md5_text
 
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for building the ChromaDB index."""
 
-    parser = argparse.ArgumentParser(description="Embed chunks_preview JSON and write chunks to ChromaDB.")
+    parser = argparse.ArgumentParser(description="Embed chunk JSON files and write chunks to ChromaDB.")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("--chunks-path", type=Path)
@@ -35,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--doc-id", default="")
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--chunk-overlap", type=int, default=None)
-    parser.add_argument("--output-preview", type=Path, default=None)
+    parser.add_argument("--output-chunks", type=Path, default=None)
     parser.add_argument("--manifest-path", type=Path, default=None)
     parser.add_argument("--persist-dir", type=Path, default=None)
     parser.add_argument("--collection", default=None)
@@ -60,14 +61,14 @@ def main() -> int:
     chunk_paths: list[Path] = []
     if args.content_list_v2:
         chunks = _build_chunks_from_content_list(args, config)
-        if args.output_preview:
-            save_chunks(args.output_preview, chunks)
-            chunk_paths = [args.output_preview.resolve()]
+        if args.output_chunks:
+            save_chunks(args.output_chunks, chunks)
+            chunk_paths = [args.output_chunks.resolve()]
     else:
         chunk_paths = _collect_chunk_paths(args)
         chunks = _load_all_chunks(chunk_paths)
     chunks_by_doc = _group_chunks_by_doc_id(chunks)
-    from offline_index.chroma_store import add_chunks, delete_by_doc_id, get_chroma_client, get_or_create_collection, reset_collection
+    from offline_index.chroma_store import add_chunks, delete_by_doc_id, get_chroma_client, get_or_create_collection, reset_collection, sync_chunks_by_location
 
     embedder = create_embedder(args.embedder, config.embedding)
     client = get_chroma_client(args.persist_dir)
@@ -81,19 +82,22 @@ def main() -> int:
     embedding_dimension: int | None = None
     manifest = load_manifest(args.manifest_path)
     for doc_id, doc_chunks in chunks_by_doc.items():
-        embeddings = embedder.embed_documents([chunk.document for chunk in doc_chunks])
-        if embeddings:
-            current_dimension = len(embeddings[0])
-            if embedding_dimension is None:
-                embedding_dimension = current_dimension
-            elif embedding_dimension != current_dimension:
-                raise ValueError(
-                    f"embedding dimension mismatch while indexing: {embedding_dimension} != {current_dimension}"
-                )
-        add_chunks(collection, doc_chunks, embeddings)
+        if args.reset:
+            embeddings = embedder.embed_documents([chunk.document for chunk in doc_chunks])
+            if embeddings:
+                current_dimension = len(embeddings[0])
+                if embedding_dimension is None:
+                    embedding_dimension = current_dimension
+                elif embedding_dimension != current_dimension:
+                    raise ValueError(
+                        f"embedding dimension mismatch while indexing: {embedding_dimension} != {current_dimension}"
+                    )
+            add_chunks(collection, doc_chunks, embeddings)
+        else:
+            sync_chunks_by_location(collection, doc_chunks, embedder)
         counts = Counter(chunk.metadata.get("chunk_type", "") for chunk in doc_chunks)
         total_counts.update(counts)
-        _update_manifest_doc(manifest, doc_id, doc_chunks, counts)
+        _update_manifest_doc(manifest, doc_id, doc_chunks, counts, config.embedding.model or args.embedder, embedding_dimension or _configured_embedding_dimension(args, config))
 
     save_manifest(manifest, args.manifest_path)
     print(f"chunk files: {len(chunk_paths)}")
@@ -105,6 +109,16 @@ def main() -> int:
     print(f"embedding dimension: {embedding_dimension if embedding_dimension is not None else 0}")
     print(f"persist dir: {args.persist_dir.resolve()}")
     print(f"collection: {args.collection}")
+    return 0
+
+
+def _configured_embedding_dimension(args: argparse.Namespace, config) -> int:
+    """Return the configured embedding dimension when no new embedding was generated in this run."""
+
+    if config.embedding.dimension is not None:
+        return config.embedding.dimension
+    if args.embedder == "mock":
+        return config.embedding.mock_dimension
     return 0
 
 
@@ -137,15 +151,15 @@ def _build_chunks_from_content_list(args: argparse.Namespace, config) -> list[Ch
 
 
 def _collect_chunk_paths(args: argparse.Namespace) -> list[Path]:
-    """Collect one chunks file or all *_chunks_preview.json files in a directory."""
+    """Collect one chunks file or all chunk JSON files in a directory."""
 
     if args.chunks_path:
         return [args.chunks_path.resolve()]
-    return sorted(path.resolve() for path in args.chunks_dir.glob("*_chunks_preview.json") if path.is_file())
+    return sorted(path.resolve() for path in args.chunks_dir.glob("*_chunks.json") if path.is_file())
 
 
 def _load_all_chunks(paths: list[Path]) -> list[ChunkRecord]:
-    """Load chunks from all selected preview files."""
+    """Load chunks from all selected chunk files."""
 
     chunks: list[ChunkRecord] = []
     for path in paths:
@@ -165,7 +179,14 @@ def _group_chunks_by_doc_id(chunks: list[ChunkRecord]) -> dict[str, list[ChunkRe
     return dict(grouped)
 
 
-def _update_manifest_doc(manifest, doc_id: str, chunks: list[ChunkRecord], counts: Counter) -> None:
+def _update_manifest_doc(
+    manifest,
+    doc_id: str,
+    chunks: list[ChunkRecord],
+    counts: Counter,
+    embedding_model: str,
+    embedding_dimension: int,
+) -> None:
     """Update a manifest record after successful Chroma indexing."""
 
     record = next((document for document in manifest.documents if document.doc_id == doc_id), None)
@@ -177,6 +198,10 @@ def _update_manifest_doc(manifest, doc_id: str, chunks: list[ChunkRecord], count
     record.text_chunk_count = counts.get("text", 0)
     record.image_chunk_count = counts.get("image", 0)
     record.table_chunk_count = counts.get("table", 0)
+    record.indexed_chunk_file_md5 = md5_text("".join(f"{chunk.id}:{chunk.metadata.get('content_md5', '')}" for chunk in chunks))
+    record.embedding_model = embedding_model
+    record.embedding_dimension = embedding_dimension
+    record.index_error = ""
     record.indexed_at = datetime.now(timezone.utc).isoformat()
     record.error_message = ""
     upsert_document(manifest, record)

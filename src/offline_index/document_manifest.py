@@ -1,4 +1,4 @@
-﻿# Loads, saves, queries, and upserts the JSON rag_documents manifest.
+﻿# Loads, saves, queries, and upserts the JSON processed_pdfs registry.
 from __future__ import annotations
 
 import json
@@ -51,4 +51,3 @@ def upsert_document(manifest: DocumentManifest, record: DocumentRecord) -> Docum
             return record
     manifest.documents.append(record)
     return record
-

@@ -1,4 +1,4 @@
-﻿# Regression tests for deterministic mock embeddings and chunk preview loading.
+﻿# Regression tests for deterministic mock embeddings and chunk file loading.
 import json
 import os
 import tempfile
@@ -36,7 +36,7 @@ class FakeHttpResponse:
 
 
 class EmbedderTests(unittest.TestCase):
-    """Covers the mock embedder and chunk preview loader."""
+    """Covers the mock embedder and chunk file loader."""
 
     def test_mock_embedder_is_deterministic_and_dimensioned(self):
         """Verify the same text always maps to the same fixed-size vector."""
@@ -54,7 +54,7 @@ class EmbedderTests(unittest.TestCase):
         self.assertTrue(all(isinstance(value, float) for value in first[0]))
 
     def test_load_chunks_accepts_list_and_dict_payloads(self):
-        """Verify chunks_preview JSON can be loaded from list or {'chunks': [...]} shapes."""
+        """Verify chunk JSON can be loaded from list or {'chunks': [...]} shapes."""
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

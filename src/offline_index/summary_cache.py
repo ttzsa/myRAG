@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from offline_index.schema import SemanticBlock
-from offline_index.utils import ensure_dir, md5_file, md5_text
+from offline_index.utils import ensure_dir, md5_file
 
 
 class SummaryCache:
@@ -43,24 +43,10 @@ class SummaryCache:
         self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def make_key(self, block: SemanticBlock, model: str, prompt_version: str) -> str:
-        """Build a cache key that changes with source image, prompt, or fallback text."""
+        """Build a cache key from only the source image bytes."""
 
         source = Path(block.source) if block.source else None
-        image_md5 = md5_file(source) if source and source.exists() else ""
-        raw = "".join(
-            [
-                block.doc_id,
-                block.block_id,
-                block.rag_type,
-                block.source,
-                image_md5,
-                block.caption,
-                block.text,
-                model,
-                prompt_version,
-            ]
-        )
-        return md5_text(raw)
+        return md5_file(source) if source and source.exists() else ""
 
     def _load(self) -> None:
         """Load any existing cache file."""

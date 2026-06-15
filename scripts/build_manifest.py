@@ -1,4 +1,4 @@
-﻿# Command-line entry point for scanning PDFs and maintaining rag_documents.json.
+﻿# Command-line entry point for scanning PDFs and maintaining processed_pdfs.json.
 from __future__ import annotations
 
 import argparse
@@ -21,29 +21,29 @@ from offline_index.offline_pipeline import build_chunks_from_mineru_content, cre
 from offline_index.source_file_finder import scan_pdfs
 from offline_index.schema import ChunkRecord, DocumentRecord, MinerUOutputLocation, PdfCandidate
 from offline_index.chunk_loader import save_chunks
-from offline_index.utils import ensure_dir, md5_text
+from offline_index.utils import ensure_dir, md5_file, md5_text
 
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for manifest construction."""
 
-    parser = argparse.ArgumentParser(description="Build or update rag_documents.json from source PDFs.")
+    parser = argparse.ArgumentParser(description="Build or update processed_pdfs.json from source PDFs.")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--pdf-root", type=Path, default=None)
     parser.add_argument("--mineru-output-root", type=Path, default=None)
     parser.add_argument("--manifest-path", type=Path, default=None)
     parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--force-vlm", action="store_true")
-    parser.add_argument("--build-chunks-preview", action="store_true")
-    parser.add_argument("--preview-output-dir", type=Path, default=None)
+    parser.add_argument("--content-list-v2", type=Path, action="append", default=None)
+    parser.add_argument("--vlm-mode", choices=["auto", "refresh", "off"], default="auto")
+    parser.add_argument("--chunks-output-dir", type=Path, default=None, metavar="CHUNKS_OUTPUT_DIR")
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--chunk-overlap", type=int, default=None)
     return parser.parse_args()
 
 
 def main() -> int:
-    """Scan PDFs, update manifest records, optionally write per-document chunk previews, and print a report."""
+    """Scan PDFs, update manifest records, write per-document chunk files, and print a report."""
 
     args = parse_args()
     config = load_config(args.env_file)
@@ -52,7 +52,7 @@ def main() -> int:
     args.manifest_path = resolve_value(args.manifest_path, config.paths.manifest_path)
     args.recursive = resolve_value(args.recursive, config.paths.pdf_recursive)
     args.force = args.force or config.paths.force_rebuild
-    args.preview_output_dir = resolve_value(args.preview_output_dir, config.paths.debug_dir)
+    args.chunks_output_dir = resolve_value(args.chunks_output_dir, config.paths.debug_dir)
     args.chunk_size = resolve_value(args.chunk_size, config.chunking.chunk_size)
     args.chunk_overlap = resolve_value(args.chunk_overlap, config.chunking.chunk_overlap)
     args.config = config
@@ -62,6 +62,8 @@ def main() -> int:
         scan_pdfs(args.pdf_root, recursive=args.recursive),
         args.mineru_output_root,
     )
+    if args.content_list_v2:
+        candidates = _filter_candidates_by_content_list_v2(candidates, args.mineru_output_root, args.content_list_v2)
     report.scanned_pdfs = len(candidates)
 
     total_start = perf_counter()
@@ -85,18 +87,14 @@ def _process_candidate(
     manifest,
     report: IndexReport,
 ) -> None:
-    """Apply manifest update and optional chunk preview generation for one PDF."""
+    """Apply manifest update and chunk file generation for one PDF."""
 
     try:
         existing_by_md5 = manifest.find_by_md5(candidate.pdf_md5)
         existing_by_source = manifest.find_by_source_path(candidate.source_path)
         if existing_by_md5 and not args.force:
             if _has_content_list_v2(Path(existing_by_md5.mineru_output_dir)):
-                if not args.build_chunks_preview or _has_existing_chunks(existing_by_md5):
-                    existing_by_md5.index_status = "skipped"
-                    existing_by_md5.error_message = ""
-                    report.existing_skipped += 1
-                    return
+                existing_by_md5.error_message = ""
             else:
                 existing_by_md5.index_status = "pending"
                 existing_by_md5.error_message = "content_list_v2.json missing; run parse_pdfs.py"
@@ -115,22 +113,28 @@ def _process_candidate(
         if location.success:
             report.mineru_output_found += 1
             record.index_status = "parsed"
-            if args.build_chunks_preview:
-                counts, preview_path, summarizer = _build_chunks_preview(candidate, record.doc_id, location, args)
-                _apply_chunk_counts(record, counts)
-                record.index_status = "chunked"
-                record.indexed_at = _now_iso()
-                print(f"chunk preview: {preview_path}")
-                if summarizer is not None:
-                    report.vlm_cache_hits += getattr(summarizer, "cache_hits", 0)
-                    report.vlm_generated += getattr(summarizer, "generated", 0)
-                    report.vlm_failed += getattr(summarizer, "failed", 0)
-                    for message in getattr(summarizer, "failure_messages", []):
-                        print(f"vlm warning: {message}")
-                report.chunk_preview_generated += 1
+            record.parse_status = "parsed"
+            counts, chunk_path, summarizer = _build_chunks_file(candidate, record.doc_id, location, args)
+            _apply_chunk_counts(record, counts)
+            record.index_status = "chunked"
+            record.chunk_status = "chunked"
+            record.chunk_path = str(chunk_path)
+            record.chunk_file_md5 = md5_file(chunk_path) if chunk_path.exists() else ""
+            record.chunk_config_hash = md5_text(f"{args.chunk_size}:{args.chunk_overlap}")
+            record.vlm_mode = getattr(args, "vlm_mode", "auto")
+            record.indexed_at = _now_iso()
+            print(f"chunk file: {chunk_path}")
+            if summarizer is not None:
+                report.vlm_cache_hits += getattr(summarizer, "cache_hits", 0)
+                report.vlm_generated += getattr(summarizer, "generated", 0)
+                report.vlm_failed += getattr(summarizer, "failed", 0)
+                for message in getattr(summarizer, "failure_messages", []):
+                    print(f"vlm warning: {message}")
+            report.chunk_files_generated += 1
         else:
             report.mineru_output_missing += 1
             record.index_status = "pending"
+            record.parse_status = "pending"
             record.error_message = location.error_message
 
         upsert_document(manifest, record)
@@ -142,6 +146,8 @@ def _process_candidate(
             manifest.find_by_source_path(candidate.source_path),
         )
         failed_record.index_status = "failed"
+        failed_record.chunk_status = "failed"
+        failed_record.chunk_error = str(exc)
         failed_record.error_message = str(exc)
         upsert_document(manifest, failed_record)
         print(f"failed: {candidate.source_path}: {exc}")
@@ -162,24 +168,27 @@ def _make_document_record(
         pdf_md5=candidate.pdf_md5,
         file_size=candidate.file_size,
         mineru_output_dir=location.mineru_output_dir,
+        parse_output_dir=location.mineru_output_dir,
+        content_list_v2_path=location.content_list_v2_path,
+        content_list_v2_md5=md5_file(Path(location.content_list_v2_path)) if location.content_list_v2_path else "",
         index_status="pending",
         error_message=location.error_message,
     )
 
 
-def _build_chunks_preview(
+def _build_chunks_file(
     candidate: PdfCandidate,
     doc_id: str,
     location: MinerUOutputLocation,
     args: argparse.Namespace,
 ) -> tuple[Counter, Path, object | None]:
-    """Build chunks from located MinerU content_list_v2 and write a per-document preview JSON."""
+    """Build chunks from located MinerU content_list_v2 and write a per-document chunk JSON."""
 
     images_dir = Path(location.images_dir) if location.images_dir else Path(location.mineru_output_dir) / "images"
     summarizer = None
     cache = None
-    if args.config.vlm.enabled:
-        summarizer, cache = create_visual_summarizer(args.config.vlm, force_vlm=args.force_vlm)
+    if args.config.vlm.enabled and args.vlm_mode != "off":
+        summarizer, cache = create_visual_summarizer(args.config.vlm, force_vlm=args.vlm_mode == "refresh")
     chunks = build_chunks_from_mineru_content(
         content_list_v2_path=Path(location.content_list_v2_path),
         images_dir=images_dir,
@@ -191,18 +200,18 @@ def _build_chunks_preview(
     )
     if cache is not None:
         cache.save()
-    preview_dir = args.preview_output_dir.resolve()
-    ensure_dir(preview_dir)
-    preview_path = preview_dir / _make_preview_file_name(candidate)
+    chunks_dir = args.chunks_output_dir.resolve()
+    ensure_dir(chunks_dir)
+    chunk_path = chunks_dir / _make_chunk_file_name(candidate)
     _print_chunk_progress(candidate.file_name, chunks)
-    save_chunks(preview_path, chunks)
-    return Counter(chunk.metadata["chunk_type"] for chunk in chunks), preview_path, summarizer
+    save_chunks(chunk_path, chunks)
+    return Counter(chunk.metadata["chunk_type"] for chunk in chunks), chunk_path, summarizer
 
 
-def _make_preview_file_name(candidate: PdfCandidate) -> str:
-    """Create a human-readable chunk preview file name from PDF stem and full content MD5."""
+def _make_chunk_file_name(candidate: PdfCandidate) -> str:
+    """Create a human-readable chunk file name from PDF stem and full content MD5."""
 
-    return f"{Path(candidate.file_name).stem}_{candidate.pdf_md5}_chunks_preview.json"
+    return f"{Path(candidate.file_name).stem}_{candidate.pdf_md5}_chunks.json"
 
 
 def _apply_chunk_counts(record: DocumentRecord, counts: Counter) -> None:
@@ -212,6 +221,7 @@ def _apply_chunk_counts(record: DocumentRecord, counts: Counter) -> None:
     record.image_chunk_count = counts.get("image", 0)
     record.table_chunk_count = counts.get("table", 0)
     record.chunk_count = record.text_chunk_count + record.image_chunk_count + record.table_chunk_count
+    record.chunk_error = ""
     record.error_message = ""
 
 
@@ -257,10 +267,20 @@ def _has_content_list_v2(output_dir: Path) -> bool:
     return output_dir.is_dir() and any(output_dir.glob("*_content_list_v2.json"))
 
 
-def _has_existing_chunks(record: DocumentRecord) -> bool:
-    """Return True when a manifest record already has built chunk counts."""
+def _filter_candidates_by_content_list_v2(
+    candidates: list[PdfCandidate],
+    output_root: Path,
+    content_list_v2_paths: list[Path],
+) -> list[PdfCandidate]:
+    """Keep candidates whose located content_list_v2 path was explicitly selected."""
 
-    return record.chunk_count > 0
+    selected = {str(path.resolve()) for path in content_list_v2_paths}
+    filtered: list[PdfCandidate] = []
+    for candidate in candidates:
+        location = locate_mineru_output(Path(candidate.source_path), output_root)
+        if location.content_list_v2_path and str(Path(location.content_list_v2_path).resolve()) in selected:
+            filtered.append(candidate)
+    return filtered
 
 
 def _filter_output_root_candidates(candidates: list[PdfCandidate], output_root: Path) -> list[PdfCandidate]:

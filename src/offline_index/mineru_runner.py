@@ -4,13 +4,14 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
+import os
 from pathlib import Path
 
 from pydantic import BaseModel
 
 from offline_index.document_manifest import load_manifest, save_manifest, upsert_document
-from offline_index.source_file_finder import compute_file_md5
-from offline_index.schema import DocumentRecord
+from offline_index.source_file_finder import compute_file_md5, find_pdf_paths
+from offline_index.schema import DocumentRecord, PdfCandidate
 from offline_index.utils import md5_text
 
 
@@ -31,16 +32,7 @@ class MinerUParseResult(BaseModel):
 def find_pdfs(input_path: Path, recursive: bool = True) -> list[Path]:
     """Find PDF files from one PDF path or a directory, optionally recursively."""
 
-    input_path = input_path.resolve()
-    if input_path.is_file():
-        return [input_path] if input_path.suffix.lower() == ".pdf" else []
-    if not input_path.exists():
-        return []
-    if not input_path.is_dir():
-        return []
-
-    pattern = "**/*.pdf" if recursive else "*.pdf"
-    return sorted(path.resolve() for path in input_path.glob(pattern) if path.is_file() and path.suffix.lower() == ".pdf")
+    return find_pdf_paths(input_path, recursive=recursive)
 
 
 def expected_mineru_output_dir(pdf_path: Path, output_root: Path) -> Path:
@@ -55,7 +47,7 @@ def is_already_parsed(pdf_path: Path, output_root: Path) -> bool:
     output_dir = expected_mineru_output_dir(pdf_path, output_root)
     if not output_dir.is_dir():
         return False
-    return any(output_dir.glob("*_content_list_v2.json")) or any(output_dir.glob("*_content_list.json")) or any(output_dir.glob("*.md"))
+    return any(output_dir.glob("*_content_list_v2.json"))
 
 
 def run_mineru_cli(
@@ -64,9 +56,12 @@ def run_mineru_cli(
     mineru_exe: Path,
     backend: str = "pipeline",
     method: str = "auto",
+    parser_method: str = "mineru",
     force: bool = False,
     timeout: int | None = None,
     manifest_path: Path | None = None,
+    model_source: str | None = None,
+    tools_config_json: Path | None = None,
 ) -> MinerUParseResult:
     """Run MinerU CLI for one PDF and return captured command status."""
 
@@ -92,6 +87,12 @@ def run_mineru_cli(
             )
 
     command = [str(mineru_exe), "-p", str(pdf_path), "-o", str(output_root), "-b", backend]
+    env = os.environ.copy()
+
+    if model_source:
+        env["MINERU_MODEL_SOURCE"] = model_source
+    if tools_config_json:
+        env["MINERU_TOOLS_CONFIG_JSON"] = str(tools_config_json.resolve())
 
     if backend == "pipeline" and method:
         command.extend(["-m", method])
@@ -104,6 +105,7 @@ def run_mineru_cli(
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         result = MinerUParseResult(
@@ -117,7 +119,7 @@ def run_mineru_cli(
             stderr=exc.stderr or "",
             error_message=f"MinerU CLI timed out after {timeout} seconds",
         )
-        _save_parse_record(manifest, manifest_path, pdf_path, output_dir, current_md5, result)
+        _save_parse_record(manifest, manifest_path, pdf_path, output_dir, current_md5, result, parser_method)
         return result
     except OSError as exc:
         result = MinerUParseResult(
@@ -129,7 +131,7 @@ def run_mineru_cli(
             return_code=-1,
             error_message=str(exc),
         )
-        _save_parse_record(manifest, manifest_path, pdf_path, output_dir, current_md5, result)
+        _save_parse_record(manifest, manifest_path, pdf_path, output_dir, current_md5, result, parser_method)
         return result
 
     success = completed.returncode == 0
@@ -145,7 +147,7 @@ def run_mineru_cli(
         stderr=completed.stderr,
         error_message="" if success else _summarize_error(completed.stderr, completed.stdout, completed.returncode),
     )
-    _save_parse_record(manifest, manifest_path, pdf_path, output_dir, current_md5, result)
+    _save_parse_record(manifest, manifest_path, pdf_path, output_dir, current_md5, result, parser_method)
     return result
 
 
@@ -159,6 +161,8 @@ def parse_pdf_dir(
     force: bool = False,
     timeout: int | None = None,
     manifest_path: Path | None = None,
+    model_source: str | None = None,
+    tools_config_json: Path | None = None,
 ) -> list[MinerUParseResult]:
     """Parse every discovered source PDF and continue after individual failures."""
 
@@ -174,12 +178,52 @@ def parse_pdf_dir(
                 mineru_exe=mineru_exe,
                 backend=backend,
                 method=method,
+                parser_method="mineru",
                 force=force,
                 timeout=timeout,
                 manifest_path=manifest_path,
+                model_source=model_source,
+                tools_config_json=tools_config_json,
             )
         )
 
+    return results
+
+
+def parse_pdf_candidates(
+    candidates: list[PdfCandidate],
+    output_root: Path,
+    mineru_exe: Path,
+    parser_method: str = "mineru",
+    backend: str = "pipeline",
+    method: str = "auto",
+    timeout: int | None = None,
+    manifest_path: Path | None = None,
+    model_source: str | None = None,
+    tools_config_json: Path | None = None,
+) -> list[MinerUParseResult]:
+    """Parse exactly the PDF candidates selected by the discover stage."""
+
+    normalized = parser_method.strip().lower()
+    if normalized != "mineru":
+        raise ValueError(f"parser method is not implemented: {parser_method}")
+    results: list[MinerUParseResult] = []
+    for candidate in candidates:
+        results.append(
+            run_mineru_cli(
+                pdf_path=Path(candidate.source_path),
+                output_root=output_root,
+                mineru_exe=mineru_exe,
+                backend=backend,
+                method=method,
+                parser_method=normalized,
+                force=True,
+                timeout=timeout,
+                manifest_path=manifest_path,
+                model_source=model_source,
+                tools_config_json=tools_config_json,
+            )
+        )
     return results
 
 
@@ -189,8 +233,7 @@ def _summarize_error(stderr: str, stdout: str, return_code: int) -> str:
     text = (stderr or stdout or "").strip()
     if not text:
         return f"MinerU CLI failed with return code {return_code}"
-    first_line = text.splitlines()[0].strip()
-    return first_line or f"MinerU CLI failed with return code {return_code}"
+    return text or f"MinerU CLI failed with return code {return_code}"
     # return text
 
 
@@ -206,6 +249,7 @@ def _save_parse_record(
     output_dir: Path,
     pdf_md5: str,
     result: MinerUParseResult,
+    parser_method: str = "mineru",
 ) -> None:
     """Persist a manifest record for a parse attempt when manifest_path is configured."""
 
@@ -218,6 +262,10 @@ def _save_parse_record(
         pdf_md5=pdf_md5,
         file_size=pdf_path.stat().st_size,
         mineru_output_dir=str(output_dir),
+        parser_method=parser_method,
+        parse_status="parsed" if result.success else "failed",
+        parse_output_dir=str(output_dir),
+        parse_error=result.error_message,
         index_status="parsed" if result.success else "failed",
         error_message=result.error_message,
     )

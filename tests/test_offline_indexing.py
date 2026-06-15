@@ -11,6 +11,7 @@ from offline_index.mineru_output_reader import flatten_blocks, read_content_list
 from offline_index.offline_pipeline import build_chunks_from_mineru_content, create_visual_summarizer
 from offline_index.schema import SemanticBlock
 from offline_index.summary_cache import SummaryCache
+from offline_index.utils import md5_file
 from offline_index.vlm_client import create_vlm_client
 from offline_index.visual_summarizer import VisualBlockSummarizer
 
@@ -206,11 +207,37 @@ class OfflineIndexingTests(unittest.TestCase):
                 self.assertIn("document", chunk.model_dump())
                 self.assertEqual(
                     set(chunk.metadata.keys()),
-                    {"doc_id", "file_name", "chunk_type", "page_start", "page_end", "source", "content_hash"},
+                    {"doc_id", "file_name", "chunk_type", "page_start", "page_end", "source", "content_md5", "meta_location"},
                 )
                 self.assertEqual(chunk.metadata["doc_id"], "doc_test")
                 self.assertEqual(chunk.metadata["file_name"], "paper.pdf")
+                self.assertTrue(chunk.metadata["meta_location"])
+                self.assertTrue(chunk.metadata["content_md5"])
                 self.assertNotIn("ignored", chunk.document)
+
+    def test_special_meta_location_stays_stable_when_visual_summary_changes(self):
+        """Verify image/table chunks can be updated in-place when only summary text changes."""
+
+        base = SemanticBlock(
+            block_id="block_000001",
+            doc_id="doc_test",
+            page_start=1,
+            page_end=1,
+            raw_type="image",
+            rag_type="image",
+            text="old summary",
+            caption="Figure 1",
+            source="image.jpg",
+            reading_order=1,
+        )
+        updated = base.model_copy(update={"text": "new summary"})
+
+        old_chunk = build_chunks([base], file_name="paper.pdf")[0]
+        new_chunk = build_chunks([updated], file_name="paper.pdf")[0]
+
+        self.assertEqual(old_chunk.metadata["meta_location"], new_chunk.metadata["meta_location"])
+        self.assertNotEqual(old_chunk.metadata["content_md5"], new_chunk.metadata["content_md5"])
+        self.assertNotEqual(old_chunk.id, new_chunk.id)
 
     def test_build_chunks_documents_do_not_repeat_metadata_headers(self):
         """Verify documents store pure chunk content instead of Type/File/Pages template headers."""
@@ -257,6 +284,232 @@ class OfflineIndexingTests(unittest.TestCase):
             self.assertNotIn("File:", chunk.document)
             self.assertNotIn("Pages:", chunk.document)
             self.assertNotIn("Content:", chunk.document)
+
+    def test_build_chunks_moves_next_page_lead_sentence_to_incomplete_page_end(self):
+        """Verify text chunks repair a sentence split across adjacent pages before chunking."""
+
+        blocks = [
+            SemanticBlock(
+                block_id="block_000001",
+                doc_id="doc_test",
+                page_start=1,
+                page_end=1,
+                raw_type="paragraph",
+                rag_type="text",
+                text="第一页最后一句没有结束",
+                reading_order=1,
+            ),
+            SemanticBlock(
+                block_id="block_000002",
+                doc_id="doc_test",
+                page_start=2,
+                page_end=2,
+                raw_type="paragraph",
+                rag_type="text",
+                text="所以这里补完。第二页保留内容。",
+                reading_order=2,
+            ),
+        ]
+
+        chunks = build_chunks(blocks, file_name="paper.pdf", chunk_size=100, chunk_overlap=10)
+
+        text_chunks = [chunk for chunk in chunks if chunk.metadata["chunk_type"] == "text"]
+        self.assertEqual([chunk.metadata["page_start"] for chunk in text_chunks], [1, 2])
+        self.assertEqual(text_chunks[0].document, "第一页最后一句没有结束所以这里补完。")
+        self.assertEqual(text_chunks[1].document, "第二页保留内容。")
+        self.assertEqual(text_chunks[0].metadata["meta_location"], "doc_test:p1:b1-1:part0")
+        self.assertEqual(text_chunks[1].metadata["meta_location"], "doc_test:p2:b1-1:part0")
+
+    def test_build_chunks_treats_comma_as_incomplete_for_cross_page_merge(self):
+        """Verify cross-page repair still requires strict sentence endings, not commas."""
+
+        blocks = [
+            SemanticBlock(
+                block_id="block_000001",
+                doc_id="doc_test",
+                page_start=1,
+                page_end=1,
+                raw_type="paragraph",
+                rag_type="text",
+                text="第一页末尾仍然是半句，",
+                reading_order=1,
+            ),
+            SemanticBlock(
+                block_id="block_000002",
+                doc_id="doc_test",
+                page_start=2,
+                page_end=2,
+                raw_type="paragraph",
+                rag_type="text",
+                text="下一页把句子补完。第二页后续。",
+                reading_order=2,
+            ),
+        ]
+
+        chunks = build_chunks(blocks, file_name="paper.pdf", chunk_size=100, chunk_overlap=10)
+
+        text_chunks = [chunk for chunk in chunks if chunk.metadata["chunk_type"] == "text"]
+        self.assertEqual(text_chunks[0].document, "第一页末尾仍然是半句，下一页把句子补完。")
+        self.assertEqual(text_chunks[1].document, "第二页后续。")
+
+    def test_build_chunks_repairs_english_sentence_split_across_pages(self):
+        """Verify cross-page repair can take an English lead sentence ending with a period."""
+
+        blocks = [
+            SemanticBlock(
+                block_id="block_000001",
+                doc_id="doc_test",
+                page_start=1,
+                page_end=1,
+                raw_type="paragraph",
+                rag_type="text",
+                text="Therefore, we extend FourLLIE to the exposure correction task and evaluate it in the",
+                reading_order=1,
+            ),
+            SemanticBlock(
+                block_id="block_000002",
+                doc_id="doc_test",
+                page_start=2,
+                page_end=2,
+                raw_type="paragraph",
+                rag_type="text",
+                text="SICE [3] dataset, which contains 512 pairs for training, and 60 image pairs for testing. Note that the frequency stage should estimate an additional amplitude transform map.",
+                reading_order=2,
+            ),
+        ]
+
+        chunks = build_chunks(blocks, file_name="paper.pdf", chunk_size=240, chunk_overlap=20)
+
+        text_chunks = [chunk for chunk in chunks if chunk.metadata["chunk_type"] == "text"]
+        self.assertEqual(
+            text_chunks[0].document,
+            "Therefore, we extend FourLLIE to the exposure correction task and evaluate it in theSICE [3] dataset, which contains 512 pairs for training, and 60 image pairs for testing.",
+        )
+        self.assertEqual(text_chunks[1].document, "Note that the frequency stage should estimate an additional amplitude transform map.")
+
+    def test_build_chunks_keeps_pages_separate_while_merging_small_blocks(self):
+        """Verify small text blocks merge inside one page but never merge across pages."""
+
+        blocks = [
+            SemanticBlock(
+                block_id="block_000001",
+                doc_id="doc_test",
+                page_start=1,
+                page_end=1,
+                raw_type="paragraph",
+                rag_type="text",
+                text="第一页第一段。",
+                reading_order=1,
+            ),
+            SemanticBlock(
+                block_id="block_000002",
+                doc_id="doc_test",
+                page_start=1,
+                page_end=1,
+                raw_type="paragraph",
+                rag_type="text",
+                text="第一页第二段。",
+                reading_order=2,
+            ),
+            SemanticBlock(
+                block_id="block_000003",
+                doc_id="doc_test",
+                page_start=2,
+                page_end=2,
+                raw_type="paragraph",
+                rag_type="text",
+                text="第二页第一段。",
+                reading_order=3,
+            ),
+        ]
+
+        chunks = build_chunks(blocks, file_name="paper.pdf", chunk_size=100, chunk_overlap=10)
+
+        text_chunks = [chunk for chunk in chunks if chunk.metadata["chunk_type"] == "text"]
+        self.assertEqual(len(text_chunks), 2)
+        self.assertEqual(text_chunks[0].metadata["page_start"], 1)
+        self.assertEqual(text_chunks[0].document, "第一页第一段。\n\n第一页第二段。")
+        self.assertEqual(text_chunks[0].metadata["meta_location"], "doc_test:p1:b1-2:part0")
+        self.assertEqual(text_chunks[1].metadata["page_start"], 2)
+        self.assertEqual(text_chunks[1].document, "第二页第一段。")
+        self.assertEqual(text_chunks[1].metadata["meta_location"], "doc_test:p2:b1-1:part0")
+
+    def test_build_chunks_splits_large_block_with_sentence_overlap_window(self):
+        """Verify only oversized single blocks use overlap and prefer complete sentence starts."""
+
+        text = "第一句内容较长。第二句内容也很重要。第三句继续说明。"
+        block = SemanticBlock(
+            block_id="block_000001",
+            doc_id="doc_test",
+            page_start=1,
+            page_end=1,
+            raw_type="paragraph",
+            rag_type="text",
+            text=text,
+            reading_order=1,
+        )
+
+        chunks = build_chunks([block], file_name="paper.pdf", chunk_size=18, chunk_overlap=8)
+
+        text_chunks = [chunk for chunk in chunks if chunk.metadata["chunk_type"] == "text"]
+        self.assertEqual([chunk.document for chunk in text_chunks], ["第一句内容较长。第二句内容也很重要。", "第二句内容也很重要。第三句继续说明。"])
+        self.assertEqual(text_chunks[0].metadata["page_start"], 1)
+        self.assertEqual(text_chunks[1].metadata["page_start"], 1)
+        self.assertEqual(text_chunks[0].metadata["meta_location"], "doc_test:p1:b1-1:part0")
+        self.assertEqual(text_chunks[1].metadata["meta_location"], "doc_test:p1:b1-1:part1")
+
+    def test_build_chunks_overlap_can_start_after_comma_boundary(self):
+        """Verify oversized-block overlap can use comma boundaries for a cleaner next window."""
+
+        text = "第一句内容很长很长。第二句前半部分很长很长很长，后半部分继续说明。第三句结束。"
+        block = SemanticBlock(
+            block_id="block_000001",
+            doc_id="doc_test",
+            page_start=1,
+            page_end=1,
+            raw_type="paragraph",
+            rag_type="text",
+            text=text,
+            reading_order=1,
+        )
+
+        chunks = build_chunks([block], file_name="paper.pdf", chunk_size=33, chunk_overlap=6)
+
+        text_chunks = [chunk for chunk in chunks if chunk.metadata["chunk_type"] == "text"]
+        self.assertEqual(text_chunks[0].document, "第一句内容很长很长。第二句前半部分很长很长很长，后半部分继续说明。")
+        self.assertTrue(text_chunks[1].document.startswith("后半部分继续说明。"))
+
+    def test_summary_cache_key_uses_only_source_image_md5(self):
+        """Verify VLM cache identity depends only on the source image bytes."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "figure.jpg"
+            image_path.write_bytes(b"same-image")
+            cache = SummaryCache(Path(tmp) / "cache.json")
+            first = SemanticBlock(
+                block_id="block_000001",
+                doc_id="doc_a",
+                page_start=1,
+                page_end=1,
+                raw_type="image",
+                rag_type="image",
+                text="caption A",
+                caption="Figure A",
+                source=str(image_path),
+                reading_order=1,
+            )
+            second = first.model_copy(
+                update={
+                    "block_id": "block_999999",
+                    "doc_id": "doc_b",
+                    "text": "caption B",
+                    "caption": "Figure B",
+                    "reading_order": 999,
+                }
+            )
+
+            self.assertEqual(cache.make_key(first, model="model-a", prompt_version="v1"), md5_file(image_path))
+            self.assertEqual(cache.make_key(first, model="model-a", prompt_version="v1"), cache.make_key(second, model="model-b", prompt_version="v2"))
 
     def test_visual_summarizer_cache_hit(self):
         """Verify cached summaries replace block text without calling the client again."""

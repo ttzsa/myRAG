@@ -1,4 +1,4 @@
-﻿# Command-line entry point for generating chunks_preview.json from MinerU output.
+﻿# Command-line entry point for generating chunk JSON from MinerU output.
 from __future__ import annotations
 
 import argparse
@@ -22,13 +22,13 @@ DEFAULT_CONTENT_LIST = DEFAULT_AUTO_DIR / "DarkIR Robust Low-Light Image Restora
 DEFAULT_IMAGES_DIR = DEFAULT_AUTO_DIR / "images"
 DEFAULT_FILE_NAME = "DarkIR Robust Low-Light Image Restoration.pdf"
 DEFAULT_DOC_ID = "doc_darkir_robust_low_light_image_restoration"
-DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "debug" / "chunks_preview.json"
+DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "chunks" / "chunks.json"
 
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments and provide defaults for the current DarkIR test output."""
 
-    parser = argparse.ArgumentParser(description="Generate preview chunks from MinerU content_list_v2.json.")
+    parser = argparse.ArgumentParser(description="Generate chunks from MinerU content_list_v2.json.")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--content-list-v2", type=Path, default=DEFAULT_CONTENT_LIST)
     parser.add_argument("--images-dir", type=Path, default=DEFAULT_IMAGES_DIR)
@@ -37,12 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--chunk-overlap", type=int, default=None)
-    parser.add_argument("--force-vlm", action="store_true")
+    parser.add_argument("--vlm-mode", choices=["auto", "refresh", "off"], default="auto")
     return parser.parse_args()
 
 
 def main() -> int:
-    """Run the MinerU-to-chunks preview pipeline and print chunk statistics."""
+    """Run the MinerU-to-chunks pipeline and print chunk statistics."""
 
     args = parse_args()
     config = load_config(args.env_file)
@@ -51,8 +51,8 @@ def main() -> int:
 
     summarizer = None
     cache = None
-    if config.vlm.enabled:
-        summarizer, cache = create_visual_summarizer(config.vlm, force_vlm=args.force_vlm)
+    if config.vlm.enabled and args.vlm_mode != "off":
+        summarizer, cache = create_visual_summarizer(config.vlm, force_vlm=args.vlm_mode == "refresh")
 
     chunks = build_chunks_from_mineru_content(
         content_list_v2_path=args.content_list_v2,
